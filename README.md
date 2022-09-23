@@ -4,7 +4,7 @@ Utility scripts that can help you to build the solutions using SQL pools in Syna
 
 # Setup
 
-Download the file [Serverless SQL utilities](serverless-sql-util.sql) and execute the T-SQL script on your serverless SQL pool. Do not use `master` database.
+Download the file [Serverless SQL utilities](serverless-sql-utilities.sql) and execute the T-SQL script on your serverless SQL pool. Do not use `master` database.
 
 # Usage
 
