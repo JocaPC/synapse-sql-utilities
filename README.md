@@ -10,7 +10,32 @@ Download the file [Serverless SQL utilities](serverless-sql-utilities.sql) and e
 
 ## CosmosDB
 
-Synapse SQL utilities enable you create views on top of CosmosDB container:
+Synapse SQL utilities enable you create views on top of CosmosDB container. 
+
+You need to specify the CosmosDB connection string, container name, and the database scoped credential that contains CosmosDB account key.
+
+```sql
+util.create_cosmosdb_view 
+			'Account=synapselink-cosmosdb-sqlsample;Database=covid',
+			'Ecdc',
+			@credential = 'CosmosDBSampleCredential';
+```
+
+This script will create a `dbo.Ecdc` view that can read data from the CosmosDB analytical storage.
+
+The procedure can automatically create a database scoped credential if you specify the ComsosDB key:
+
+```sql
+util.create_cosmosdb_view 
+			'Account=synapselink-cosmosdb-sqlsample;Database=covid',
+			'Ecdc',
+			@credential = 'CosmosDBSampleCredential',  --> This will drop previous credential to create a new one
+			@key = 's5zarR2pT0JWH9k8roipnWxUYBegOuFGjJpSjGlR36y86cW0GQ6RaaG8kGjsRAQoWMw1QKTkkX8HQtFpJjC8Hg==';
+```
+
+NOTE: This call will delete previous credential and create a new one!
+
+The third option is to create CosmosDB view with the inline key that is placed in the view definition:
 
 ```sql
 util.create_cosmosdb_view 
@@ -22,6 +47,9 @@ util.create_cosmosdb_view
 			'Ecdc',
 			@key = 's5zarR2pT0JWH9k8roipnWxUYBegOuFGjJpSjGlR36y86cW0GQ6RaaG8kGjsRAQoWMw1QKTkkX8HQtFpJjC8Hg==';
 ```
+
+This might not be good option from the security perspective because someone might see the key in the view definition and you would need to regenerate the views
+if the CosmosDB key is re-generated.
 
 ### Delta Lake
 
