@@ -555,13 +555,16 @@ AS BEGIN
 
 	DECLARE @tsql NVARCHAR(MAX) 
 
-	IF(@key IS NOT NULL)
+	IF(@key IS NOT NULL AND @credential IS NOT NULL)
 	BEGIN
-		PRINT 'Creating CosmosDB credenital'
-		SET @tsql = "CREATE DATABASE SCOPED CREDENTIAL " + @credential +
-						" WITH IDENTITY = 'SHARED ACCESS SIGNATURE', " +
-						" SECRET = '" + @key + "'"
-
+		PRINT 'Creating CosmosDB credential...'
+		SET @tsql =
+"DROP DATABASE SCOPED CREDENTIAL " + @credential + ";
+CREATE DATABASE SCOPED CREDENTIAL " + @credential + "
+		WITH	IDENTITY = 'SHARED ACCESS SIGNATURE', " + "
+				SECRET = '" + @key + "';"
+		PRINT (@tsql)
+		EXEC (@tsql)
 	END
 
 	IF (@credential IS NULL) 
@@ -626,7 +629,11 @@ AS BEGIN
 	exec sys.sp_describe_first_result_set @tsql;
 
 	declare @with_clause nvarchar(max);
-	set @with_clause = (select ' WITH (' + string_agg(QUOTENAME(name) + ' ' + system_type_name, ', ') + ')' from #frs);
+	set @with_clause = (select ' WITH (' + string_agg(
+												QUOTENAME(name) + ' ' +
+												IIF( CHARINDEX("VARCHAR", system_type_name) = 0, system_type_name, system_type_name + ' COLLATE Latin1_General_100_BIN2_UTF8'),
+											', ') + ')'
+						from #frs);
 
 	set @tsql = "CREATE OR ALTER VIEW " + QUOTENAME(@schema_name) + "." + QUOTENAME(@container) + " AS " + REPLACE(
 					REPLACE(@tsql, "TOP 0", ""),
@@ -636,3 +643,4 @@ AS BEGIN
 	PRINT @tsql
 	EXEC(@tsql)
 END
+
