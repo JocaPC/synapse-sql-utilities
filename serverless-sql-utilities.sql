@@ -440,7 +440,7 @@ AS BEGIN
     select version = CAST(a.filepath(1) AS BIGINT), added_file = json_value([add], '$.path'), removed_file = json_value([remove], '$.path')
     from openrowset(bulk '", @location  ,"/_delta_log/*.checkpoint.parquet',
                     format='parquet')
-            with ( [add] varchar(4000), [remove] varchar(4000) ) as a
+            with ( [add] varchar(8000), [remove] varchar(8000) ) as a
     where CAST(a.filepath(1) AS BIGINT) <= ", @asOfVersion, "
 	and NOT ( [add] IS NULL AND [remove] IS NULL)
     ),
@@ -476,7 +476,7 @@ AS BEGIN
             FIELDQUOTE = '0x0b', 
             ROWTERMINATOR = '0x0A'
         )
-        WITH (jsonContent NVARCHAR(4000)) AS [r]
+        WITH (jsonContent NVARCHAR(max)) AS [r]
         CROSS APPLY OPENJSON(jsonContent)
             WITH (added_file nvarchar(1000) '$.add.path', removed_file nvarchar(1000) '$.remove.path') AS j
     WHERE (r.filepath(1) >", @version,") --> Take the changes after checkpoint
