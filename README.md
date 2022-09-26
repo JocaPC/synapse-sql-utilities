@@ -58,7 +58,7 @@ Use the procedure `delta.create_table` to create a table on data set placed on D
 ```sql
 delta.create_table 'TimeTravel', 'abfss://<container>@<storage account>.dfs.core.windows.net/time-travel'
 
-select top 10 * from TimeTravel
+SELECT TOP 10 * FROM TimeTravel
 ```
 
 Use the procedure `delta.describe_history` to see the history of changes in Delta Lake:
@@ -73,9 +73,15 @@ and specify the version, and you will get a view in the format `<table name>@v<v
 ```sql
 delta.snapshot 'TimeTravel', 21
 
-select * from TimeTravel@v21
+SELECT TOP 10 * FROM TimeTravel@v21;
 
 delta.snapshot 'TimeTravel', 17
 
-select * from TimeTravel@v17
+SELECT TOP 10 * FROM TimeTravel@v17;
+
+delta.snapshot 'TimeTravel', @timestamp = '2022-09-23 11:48:19.000'
+
+-- Assumption is that v66 is created for the timestamp '2022-09-23 11:48:19.000'
+SELECT TOP 10 * FROM TimeTravel@v66;
+
 ```
