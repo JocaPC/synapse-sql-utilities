@@ -71,6 +71,31 @@ AS BEGIN
 END
 GO
 
+
+CREATE OR ALTER PROCEDURE util.die_table @table_name sysname, @schema_name sysname = ''
+AS BEGIN
+	IF(0<(SELECT count(*) FROM sys.external_tables 
+							WHERE name = @table_name 
+							AND SCHEMA_NAME(schema_id) = IIF(@schema_name = '', SCHEMA_NAME(), @schema_name)))
+	BEGIN
+		DECLARE @tsql NVARCHAR(4000) = 'DROP EXTERNAL TABLE ' + IIF(@schema_name = '', SCHEMA_NAME(), QUOTENAME(@schema_name)) + '.' + QUOTENAME(@table_name);
+		PRINT(@tsql)
+		EXEC(@tsql)
+	END
+END
+GO
+
+CREATE OR ALTER PROCEDURE util.create_or_alter_table @table_name sysname, @path varchar(1024),
+						@file_format sysname, @data_source sysname = null, 
+						@schema_name sysname = '', @database_name sysname = null
+AS BEGIN
+	EXEC util.die_table @table_name, @schema_name
+	EXEC util.create_table @table_name, @path,
+						@file_format, @data_source, 
+						@schema_name, @database_name
+END
+GO
+
 /*
 EXEC util.create_table 'Test', 'https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel'
 */
@@ -485,6 +510,15 @@ AS BEGIN
 	EXEC util.create_table @table_name, @path, 'DELTA', @data_source, @schema_name, @database_name; 
 END
 GO
+
+CREATE OR ALTER PROCEDURE delta.create_or_alter_table @table_name sysname, @path varchar(1024),
+						@data_source sysname = null, 
+						@schema_name sysname = '', @database_name sysname = null
+AS BEGIN
+	EXEC util.create_or_alter_table @table_name, @path, 'DELTA', @data_source, @schema_name, @database_name; 
+END
+GO
+
 
 CREATE OR ALTER PROCEDURE delta._get_tables @path varchar(1024), @folder varchar(256) = '/*/*'
 AS BEGIN
