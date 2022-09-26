@@ -88,7 +88,7 @@ AS BEGIN
 	BEGIN
 		DECLARE @relative_path varchar(128) = '';
 		EXEC util.create_data_source
-					@path,
+					@path, NULL,
 					@data_source OUTPUT, 
 					@relative_path OUTPUT 
 	END
@@ -643,4 +643,3 @@ CREATE DATABASE SCOPED CREDENTIAL " + @credential + "
 	PRINT @tsql
 	EXEC(@tsql)
 END
-
