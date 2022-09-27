@@ -391,7 +391,7 @@ AS BEGIN
 	EXEC delta._get_latest_checkpoint_files @location, @version
 
 	IF(0 = (SELECT COUNT(*) FROM #log_files)) BEGIN
-		RAISERROR('Version "%i" is not avalable for time travel. Cannot find checkpoint before this version', 19, 1, @version) WITH LOG;
+		RAISERROR('Version "%i" is not available for time travel. Cannot find checkpoint before this version.', 19, 1, @version) WITH LOG;
 		RETURN
 	END
 	ELSE
