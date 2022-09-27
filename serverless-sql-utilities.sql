@@ -1,679 +1,451 @@
-SET QUOTED_IDENTIFIER OFF
-GO
-BEGIN TRY
-EXEC('CREATE SCHEMA util');
-END TRY
-BEGIN CATCH END CATCH
-GO
-BEGIN TRY
-EXEC('CREATE SCHEMA delta');
-END TRY
-BEGIN CATCH END CATCH
+--------------------------------------------------------------------------------
+--	Synapse serverless SQL pool - Query Performance Insights
+--	Author: Jovan Popovic
+--------------------------------------------------------------------------------
+
+SET QUOTED_IDENTIFIER OFF; -- Because I use "" as a string literal
 GO
 
------------------------------------------------------------------------------------
---			Generic utilities
------------------------------------------------------------------------------------
-/*
-DECLARE @data_source varchar(128) = ''
-DECLARE @relative_path varchar(128) = ''
-EXEC util.create_data_source
-			'https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel',
-			@data_source OUTPUT, 
-			@relative_path OUTPUT 
-PRINT @data_source
-PRINT @relative_path
-*/
-
-CREATE OR ALTER PROCEDURE util.create_data_source
-								@path varchar(1024),
-								@credential varchar(1024) = null,
-								@data_source varchar(128) OUTPUT,
-								@relative_path varchar(128) OUTPUT
-AS BEGIN
-	DECLARE @tsql NVARCHAR(max);
-	if(SUBSTRING(@path, 1, 8) NOT IN ('https://', 'abfss://'))
-	begin
-		raiserror('The @path must be absolute paths', 16, 1);
-		return
-	end
-	SET @data_source = SUBSTRING(@path, 9, CHARINDEX('.',@path)-9);
-	DECLARE @data_source_location varchar(1024) = SUBSTRING( @path, 0, CHARINDEX('/',@path, 10));
-	SET @relative_path = SUBSTRING( @path, CHARINDEX('/',@path, 10), 1028);
-	if(@credential is not null)
-	BEGIN
-		IF (@credential = 'Managed Identity') BEGIN
-			CREATE DATABASE SCOPED CREDENTIAL [Managed Identity] WITH IDENTITY = 'Managed Identity';
-			SET @credential = 'Managed Identity';
-		END
-		ELSE IF (SUBSTRING(@credential, 1, 4) = 'sas:') BEGIN
-			set @tsql = CONCAT("CREATE DATABASE SCOPED CREDENTIAL [",@data_source,"]
-									WITH IDENTITY = 'SHARED ACCESS SIGNATURE',
-									SECRET = '", SUBSTRING(@credential, 4, 1024), "'");
-			PRINT 'Creating a database scoped credential...';
-			PRINT @tsql;
-			EXEC (@tsql);
-			SET @credential = SUBSTRING(@credential, 4, 1024);
-		END
-			
-	END
-	IF(0 = (select count(*) from sys.external_data_sources where name = @data_source))
-	begin
-		SET @tsql = 
-			CONCAT("CREATE EXTERNAL DATA SOURCE [", @data_source, "] WITH ( LOCATION = '",@data_source_location,"'",
-				IIF(@credential IS NOT NULL, ", CREDENTIAL = " + @credential, ""),
-			")");
-	
-		PRINT 'Creating external data source...'
-		PRINT (@tsql)
-		EXEC (@tsql) 
-	end
-END
+IF SCHEMA_ID('qpi') IS NULL
+	EXEC ('CREATE SCHEMA qpi');
 GO
 
+CREATE OR ALTER  VIEW qpi.queries
+AS
+SELECT
+		text =   IIF(LEFT(text,1) = '(', TRIM(')' FROM SUBSTRING( text, (PATINDEX( '%)[^),]%', text))+1, LEN(text))), text) ,
+		params =  IIF(LEFT(text,1) = '(', SUBSTRING( text, 2, (PATINDEX( '%)[^),]%', text+')'))-2), '') ,
+		execution_type_desc = status COLLATE Latin1_General_CS_AS,
+		first_execution_time = start_time, last_execution_time = NULL, count_executions = NULL,
+		elapsed_time_s = total_elapsed_time /1000.0,
+		cpu_time_s = cpu_time /1000.0,
+		logical_io_reads = logical_reads,
+		logical_io_writes = writes,
+		physical_io_reads = reads,
+		num_physical_io_reads = NULL,
+		clr_time = NULL,
+		dop,
+		row_count,
+		memory_mb = granted_query_memory *8 /1000,
+		log_bytes = NULL,
+		tempdb_space = NULL,
+		query_text_id = NULL, query_id = NULL, plan_id = NULL,
+		database_id, connection_id, session_id, request_id, command,
+		interval_mi = null,
+		start_time,
+		end_time = null,
+		sql_handle
+FROM    sys.dm_exec_requests
+		CROSS APPLY sys.dm_exec_sql_text(sql_handle)
+WHERE session_id <> @@SPID
 
-CREATE OR ALTER PROCEDURE util.die_table @table_name sysname, @schema_name sysname = ''
-AS BEGIN
-	IF(0<(SELECT count(*) FROM sys.external_tables 
-							WHERE name = @table_name 
-							AND SCHEMA_NAME(schema_id) = IIF(@schema_name = '', SCHEMA_NAME(), @schema_name)))
-	BEGIN
-		DECLARE @tsql NVARCHAR(4000) = 'DROP EXTERNAL TABLE ' + IIF(@schema_name = '', SCHEMA_NAME(), QUOTENAME(@schema_name)) + '.' + QUOTENAME(@table_name);
-		PRINT(@tsql)
-		EXEC(@tsql)
-	END
-END
 GO
 
-CREATE OR ALTER PROCEDURE util.create_or_alter_table @table_name sysname, @path varchar(1024),
-						@file_format sysname, @data_source sysname = null, 
-						@schema_name sysname = '', @database_name sysname = null
-AS BEGIN
-	EXEC util.die_table @table_name, @schema_name
-	EXEC util.create_table @table_name, @path,
-						@file_format, @data_source, 
-						@schema_name, @database_name
-END
+CREATE OR ALTER  VIEW qpi.query_history
+AS
+SELECT  query_text_id = query_hash,
+        request_id = distributed_statement_id,
+        elapsed_time_s = total_elapsed_time_ms /1000.,
+        query_text = CASE query_text
+         WHEN '*** Internal delta query ***' THEN 'Scanning Delta transaction log...'
+         WHEN '*** Global stats query ***' THEN 'Collecting file statistics...'
+         WHEN '*** External table stats query ***' THEN 'Collecting file statistics...'
+         ELSE query_text END,
+        data_processed_mb = data_processed_mb,
+        start_time, end_time,
+        transaction_id,
+        status,
+        error, error_code
+FROM sys.dm_exec_requests_history
 GO
 
-/*
-EXEC util.create_table 'Test', 'https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel'
-*/
-CREATE OR ALTER PROCEDURE util.create_table @table_name sysname, @path varchar(1024),
-						@file_format sysname, @data_source sysname = null, 
-						@schema_name sysname = '', @database_name sysname = null
-AS BEGIN
+CREATE OR ALTER
+FUNCTION qpi.cmp_queries (@request_id1 varchar(40), @request_id2 varchar(40))
+returns table
+return (
+	select property = a.[key], a.value query_1, b.value query_2
+	from
+	(select [key], value
+	from openjson(
+	(select *
+		from qpi.query_history
+		where request_id = @request_id1
+		for json path, without_array_wrapper)
+	)) as a ([key], value)
+	join
+	(select [key], value
+	from openjson(
+	(select *
+		from qpi.query_history
+		where request_id = @request_id2
+		for json path, without_array_wrapper)
+	)) as b ([key], value)
+	on a.[key] = b.[key]
+	where a.value <> b.value
 
-	DECLARE @tsql NVARCHAR(MAX);
-	DECLARE @eds_location varchar(1024)
-	DECLARE @table_location varchar(1024)
+);
+go
+CREATE OR ALTER VIEW qpi.recommendations
+AS
+with sql_definition as (
+		select 
+		object_id,
+		format_type = CASE
+				WHEN UPPER(m.definition) LIKE '%''PARQUET''%' THEN 'PARQUET'
+				WHEN UPPER(m.definition) LIKE '%''DELTA''%' THEN 'DELTA'
+				WHEN UPPER(m.definition) LIKE '%''CSV''%' THEN 'CSV'
+				WHEN UPPER(m.definition) LIKE '%''COSMOSDB''%' THEN 'COSMOSDB'
+				WHEN 		UPPER(m.definition) NOT LIKE '%''PARQUET''%'
+						AND (UPPER(m.definition) NOT LIKE '%''CSV''%' )
+						AND (UPPER(m.definition) NOT LIKE '%''DELTA''%' )
+						AND (UPPER(m.definition) NOT LIKE '%''COSMOSDB''%' )
+						THEN 'COMPOSITE'
+				ELSE 'MIXED'
+			END
+		from sys.sql_modules m
+),
+bulkpath as (
+select schema_name = schema_name(v.schema_id), v.name, val =TRIM(SUBSTRING( LOWER(m.definition) , PATINDEX('%bulk%', LOWER(m.definition)), 2048)), m.definition
+from sys.views v
+join sys.sql_modules m on v.object_id = m.object_id
+where PATINDEX('%bulk%', LOWER(m.definition)) > 0
+and schema_name(v.schema_id) <> 'qpi'
+),
+view_path as (
+select  name,
+		schema_name,
+		path = SUBSTRING(val, 
+						CHARINDEX('''', val, 0)+1,
+						(CHARINDEX('''', val, CHARINDEX('''', val, 0)+1) - CHARINDEX('''', val, 0) - 1)) 
+from bulkpath
+where CHARINDEX('''', val, 0) > 0
+and schema_name <> 'qpi'
+),
+recommendations as (
 
-	IF(@data_source IS NULL AND SUBSTRING(@path, 1, 8) IN ('https://', 'abfss://'))
-	-- Automaticaly create a data source based on the @path.
-	BEGIN
-		DECLARE @relative_path varchar(128) = '';
-		EXEC util.create_data_source
-					@path, NULL,
-					@data_source OUTPUT, 
-					@relative_path OUTPUT 
-	END
-	
-	SELECT @eds_location = location FROM util.get_data_source_location(@data_source)
+select	name = 'USE VARCHAR UTF-8 TYPE',
+        score = 1.0,
+		schema_name = schema_name(v.schema_id),
+		object = v.name,
+		column_name = c.name,
+		reason =	CONCAT('The view ', v.name, ' that is created on ', m.format_type,' dataset has ', count(c.column_id), ' columns with ') +
+					IIF( t.name = 'nchar', 'NVARCHAR/NCHAR type.', 'VARCHAR/CHAR type without UTF-8 collation.') +
+					' You might get conversion error.' +
+					' Change the column types to VARCHAR with some UTF8 collation.'
+from sys.views as v join sys.columns as c on v.object_id = c.object_id
+join sql_definition m on v.object_id = m.object_id
+join sys.types t on c.user_type_id = t.user_type_id
+where (	m.format_type IN ('PARQUET', 'DELTA', 'COSMOSDB', 'MIXED') )
+AND	( (t.name iN ('nchar', 'nvarchar')) OR (t.name iN ('nchar', 'nvarchar') AND c.collation_name NOT LIKE '%UTF8') )
+group by v.schema_id, v.name, t.name, m.format_type, c.name
+union all
+-- Tables on UTF-8 files with NVARCHAR/NCHAR columns or CHAR/VARCHAR without UTF8 collation:
+select	name = 'USE VARCHAR TYPE',
+        score = IIF( t.name LIKE 'n%', 0.3, 1.0),
+		schema_name = schema_name(e.schema_id),
+		object = e.name,
+		column_name = IIF(count(c.column_id)=1, max(c.name), CONCAT(count(c.column_id), ' columns')),
+		reason =	CONCAT('The table "', schema_name(e.schema_id), '.', e.name, '" that is created on ', f.format_type, ' files ') +
+					CONCAT(IIF( f.encoding = 'UTF8', ' with UTF-8 encoding ', ''), ' has ',
+					IIF(count(c.column_id)=1, '"' + max(c.name) + '" column', CONCAT(count(c.column_id), ' columns') ), ' with ') +
+					IIF( t.name LIKE 'n%', 'NVARCHAR/NCHAR', 'VARCHAR/CHAR without UTF-8 collation.') +
+					' type. Change the column types to VARCHAR with some UTF8 collation.'
+from sys.external_tables as e join sys.columns as c on e.object_id = c.object_id
+join sys.external_file_formats f on e.file_format_id = f.file_format_id
+join sys.types t on c.user_type_id = t.user_type_id
+where ( (f.format_type IN ('PARQUET', 'DELTA')) OR f.encoding = 'UTF8' )
+AND	( (t.name iN ('nchar', 'nvarchar')) OR (t.name iN ('nchar', 'nvarchar') AND c.collation_name NOT LIKE '%UTF8'))
+group by e.schema_id, f.format_type, e.name, f.encoding , t.name, c.name
+union all
+-- Tables on UTF-16 files with VARCHAR/CHAR columns:
+select	name = 'USE NVARCHAR TYPE',
+        score = 1.0,
+		
+		schema_name = schema_name(e.schema_id),
+		object = e.name,
+		column_name = IIF(count(c.column_id)=1, max(c.name), CONCAT(count(c.column_id), ' columns')),
+		reason =	CONCAT('The table "',  schema_name(e.schema_id), '.', e.name, '" created on CSV files with UTF16 encoding has ', 
+						IIF(count(c.column_id)=1, '"' + max(c.name) + '" column', CONCAT(count(c.column_id), ' columns') ), ' with ') +
+					'VARCHAR/CHAR type. Change the column type to NVARCHAR.'
+from sys.external_tables as e join sys.columns as c on e.object_id = c.object_id
+join sys.external_file_formats f on e.file_format_id = f.file_format_id
+join sys.types t on c.user_type_id = t.user_type_id
+where (f.encoding = 'UTF16' )
+AND	(t.name iN ('nchar', 'nvarchar'))
+group by e.schema_id, f.format_type, e.name, f.encoding , t.name
+union all
+select	name = 'OPTIMIZE STRING FILTER',
+        score = case
+					when string_agg(c.name,',') like '%id%' then 0.9
+					when string_agg(c.name,',') like '%code%' then 0.9
+					when count(c.column_id) > 1 then 0.81
+					else 0.71
+					end,
+		
+		schema_name = schema_name(v.schema_id),
+		object = v.name,
+		column_name = IIF(count(c.column_id)=1, max(c.name), CONCAT(count(c.column_id), ' columns')),
+		reason =	CONCAT('The view "',  schema_name(v.schema_id), '.', v.name, '" that is created on ', m.format_type, ' dataset has ',
+							IIF(count(c.column_id)=1, '"' + max(c.name) + '" column', CONCAT(count(c.column_id), ' columns') ), ' with ') +
+					IIF( t.name = 'nchar', 'NVARCHAR/NCHAR type.', 'VARCHAR/CHAR type without BIN2 UTF8 collation.') +
+					' Change the column types to VARCHAR with the Latin1_General_100_BIN2_UTF8 collation.'
+from sys.views as v join sys.columns as c on v.object_id = c.object_id
+join sql_definition m on v.object_id = m.object_id
+join sys.types t on c.user_type_id = t.user_type_id
+where (	m.format_type IN ('PARQUET', 'DELTA', 'COSMOSDB', 'MIXED') )
+AND	( t.name IN ('char', 'varchar') AND c.collation_name <> 'Latin1_General_100_BIN2_UTF8' )
+group by v.schema_id, v.name, t.name, m.format_type
 
-	IF(@eds_location IS NULL)
-	BEGIN
-		DECLARE @msg VARCHAR(8000);
-		SET @msg = CONCAT('Cannot find external data source ', @data_source);
-		RAISERROR (@msg, 16, 1)
-		RETURN
-	END
+union all
 
-	IF(SUBSTRING(@path, 1, 8) IN ('https://', 'abfss://') AND PATINDEX('%'+@eds_location+'%', @path) = 0)
-	BEGIN
-		SET @msg = CONCAT('Path ', @path, ' is not referencing a folder within the external data source location: ', @eds_location);
-		RAISERROR (@msg, 16, 1)
-		RETURN
-	END
+-- Tables on Parquet/Delta Lake files with the columns without BIN2 UTF-8 collation:
+select	name = 'OPTIMIZE STRING FILTER',
+		score = 0.6,
+        schema_name = schema_name(e.schema_id),
+		object = e.name,
+		column_name = c.name,
+		reason = CONCAT('The string column "', c.name, '" in table "', schema_name(t.schema_id), '.', t.name, '" doesn''t have "Latin1_General_100_BIN2_UTF8". String filter on this column are suboptimal')
+from sys.external_tables as e join sys.columns as c on e.object_id = c.object_id
+join sys.external_file_formats f on e.file_format_id = f.file_format_id
+join sys.types t on c.user_type_id = t.user_type_id
+where ( (f.format_type IN ('PARQUET', 'DELTA'))) AND t.name IN ('char', 'varchar') AND c.collation_name <> 'Latin1_General_100_BIN2_UTF8'
 
-	DECLARE @file_format_name varchar(20) = NULL;
-	DECLARE @file_format_type varchar(20) = NULL;
-	select @file_format_name = name, @file_format_type = format_type
-	from sys.external_file_formats
-	where name = @file_format or format_type = @file_format;
+union all
+-- Oversized string columns:
+select	name = 'OPTIMIZE COLUMN TYPE',
+        score = ROUND(0.3 + (IIF(c.max_length=-1, 0.7*12000., c.max_length)/12000.),1),
+		schema_name = schema_name(o.schema_id),
+		object = o.name,
+		column_name = c.name,
+		reason = CONCAT('The string column "', c.name, '" has a max size ', 
+				IIF(c.max_length=-1, ' 2 GB', CAST( c.max_length AS VARCHAR(10)) + ' bytes'), '. Check could you use a column with a smaller size.',
+				IIF(o.type = 'U', ' Table ', ' View '), '"', schema_name(o.schema_id), '.', o.name, '"')
+from sys.objects as o join sys.columns as c on o.object_id = c.object_id
+join sys.types t on c.user_type_id = t.user_type_id
+where t.name LIKE '%char' AND (c.max_length > 256 OR c.max_length = -1)
+and o.type in ('U', 'V')
+and lower(c.name) not like '%desc%'
+and lower(c.name) not like '%comment%'
+and lower(c.name) not like '%note%'
+and lower(c.name) not like '%exception%'
+and lower(c.name) not like '%reason%'
+and lower(c.name) not like '%explanation%'
+union all
 
-	if(@file_format_name IS NULL)
-	begin
-		if(@file_format IN ('DELTA', 'PARQUET'))
-		begin
-			SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "] WITH ( FORMAT_TYPE = ",@file_format,")");
-			EXEC(@tsql);
-			SET @file_format_name = @file_format;
-		end else if (@file_format = 'CSV')
-		begin
-			SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "]
-										WITH ( FORMAT_TYPE = DELIMITEDTEXT, FORMAT_OPTIONS ( STRING_TERMINATOR = ',' ) )");
-			EXEC(@tsql);
-			SET @file_format_name = @file_format;
-		end else if (@file_format = 'TSV')
-		begin
-			SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "]
-										WITH ( FORMAT_TYPE = DELIMITEDTEXT, FORMAT_OPTIONS ( STRING_TERMINATOR = '\t' ) )");
-			EXEC(@tsql);
-			SET @file_format_name = @file_format;
-		end
-	end
-	IF @file_format_name IS NULL BEGIN
-		RAISERROR ( 'Cannot find external format type', 16, 1 );
-		RETURN;
-	END ELSE
-	IF @file_format_type = 'CSV' BEGIN
-		SET @file_format_type = "'CSV', PARSER_VERSION='2.0'";
-	END ELSE
-		SET @file_format_type = "'" + @file_format_type + "'";
+-- Oversized key columns:
+select	name = 'OPTIMIZE KEY COLUMN TYPE',
+        score = 0.4 + ROUND((1-EXP(-IIF(c.max_length=-1, 8000., c.max_length)/8000.)),1),
+		schema_name = schema_name(o.schema_id),
+		object = o.name,
+		column_name = c.name,
+		reason = CONCAT('Are you using the column "', c.name, '" in join/filter predicates? ',
+							'The column type is ', t.name, '(size:',IIF(c.max_length=-1, ' 2 GB', CAST( c.max_length AS VARCHAR(10)) + ' bytes'),'). ',
+							'Try to use a column with a smaller type or size.')
+from sys.objects as o join sys.columns as c on o.object_id = c.object_id
+join sys.types t on c.user_type_id = t.user_type_id
+where (c.name LIKE '%code' OR  c.name LIKE '%id') AND (c.max_length > 8 OR c.max_length = -1)
+and o.type in ('U', 'V')
 
-	SET @tsql = CONCAT("SELECT TOP 0 * FROM OPENROWSET(BULK '", @path, "', FORMAT = ", @file_format_type, " ) as data");
+union all
 
-	create table #frs (
-		is_hidden bit not null,
-		column_ordinal int not null,
-		name sysname null,
-		is_nullable bit not null,
-		system_type_id int not null,
-		system_type_name nvarchar(256) null,
-		max_length smallint not null,
-		precision tinyint not null,
-		scale tinyint not null,
-		collation_name sysname null,
-		user_type_id int null,
-		user_type_database sysname null,
-		user_type_schema sysname null,
-		user_type_name sysname null,
-		assembly_qualified_type_name nvarchar(4000),
-		xml_collection_id int null,
-		xml_collection_database sysname null,
-		xml_collection_schema sysname null,
-		xml_collection_name sysname null,
-		is_xml_document bit not null,
-		is_case_sensitive bit not null,
-		is_fixed_length_clr_type bit not null,
-		source_server sysname null,
-		source_database sysname null,
-		source_schema sysname null,
-		source_table sysname null,
-		source_column sysname null,
-		is_identity_column bit null,
-		is_part_of_unique_key bit null,
-		is_updateable bit null,
-		is_computed_column bit null,
-		is_sparse_column_set bit null,
-		ordinal_in_order_by_list smallint null,
-		order_by_list_length smallint null,
-		order_by_is_descending smallint null,
-		tds_type_id int not null,
-		tds_length int not null,
-		tds_collation_id int null,
-		tds_collation_sort_id tinyint null
-	);
+-- The tables that are referencing the same location:
+select	name = 'REMOVE DUPLICATE REFERENCES',
+        score = 0.9,
+		schema_name = NULL,
+		object = NULL,
+		column_name = NULL,
+		reason = CONCAT('The tables ', string_agg(concat('"',schema_name(e.schema_id),'.',e.name,'"'), ','), ' are referencing the same location')
+from sys.external_tables e
+group by data_source_id, location
+having count(*) > 1
 
-	insert #frs
-	exec sys.sp_describe_first_result_set @tsql;
+union all
 
-	declare @column_schema nvarchar(max);
-	set @column_schema = (select '(' + string_agg(QUOTENAME(name) + ' ' + system_type_name, ', ') + ')' from #frs);
-	set @tsql = CONCAT("CREATE EXTERNAL TABLE ", 
-						ISNULL(@database_name, DB_NAME()) + "." + @schema_name+".", @table_name, "
-						",@column_schema, "
-						WITH (	LOCATION = '"+ REPLACE( @path, @eds_location,'') +"', 
-								DATA_SOURCE = [", @data_source, "],
-								FILE_FORMAT = [", @file_format_name,"]);")
-	PRINT 'Creating external table...'
-	PRINT(@tsql)
-	EXEC(@tsql)
-END
-GO
+-- Partitioned external table
+select	name = 'REPLACE TABLE WITH PARTITIONED VIEW',
+        score = 1.0,
+		schema_name = schema_name(e.schema_id),
+		object = e.name,
+		column_name = NULL,
+		reason = CONCAT('The table ', e.name, ' is created on a partitioned data set, but cannot leverage partition elimination. Replace it with a partitioned view.')
+from sys.external_tables e
+where REPLACE(location, '*.', '') like '%*%'
 
+union all
 
------------------------------------------------------------------------------------
---			Delta Lake utilities
------------------------------------------------------------------------------------
+select	name = 'USE BETTER COLUMN TYPE',
+        score = IIF(c.max_length=-1, 1.0, 0.2 + ROUND((1-EXP(-c.max_length/50.))/2,1)),
+		schema_name = schema_name(o.schema_id),
+		object = o.name,
+		column_name = c.name,
+		reason = CONCAT('Do you need to use the type "', t.name, '(size:',IIF(c.max_length=-1, ' 2 GB', CAST( c.max_length AS VARCHAR(10)) + ' bytes'),') in column "', c.name, '" in view: "', schema_name(o.schema_id), '.', o.name, '"')
+from sys.objects as o join sys.columns as c on o.object_id = c.object_id
+join sys.types t on c.user_type_id = t.user_type_id
+where
+	t.name IN ('nchar', 'nvarchar', 'char', 'varchar', 'binary', 'varbinary')
+AND
+	(	LOWER(c.name) like '%date%' OR LOWER(c.name) like '%time%' 
+	OR	LOWER(c.name) like '%guid%'
+	OR	LOWER(c.name) like '%price%' OR LOWER(c.name) like '%amount%' )
+AND
+	o.type in ('U', 'V')
+and lower(c.name) not like '%desc%'
+and lower(c.name) not like '%comment%'
+and lower(c.name) not like '%note%'
+and lower(c.name) not like '%exception%'
+and lower(c.name) not like '%reason%'
+and lower(c.name) not like '%explanation%'
 
-/*
-SELECT * 
-	FROM delta.get_table_location('timetravel')
-*/
-CREATE OR ALTER FUNCTION delta.get_table_location(@table varchar(128))
-RETURNS TABLE
-AS RETURN (
-    select	delta_uri = TRIM('/' FROM eds.location) + '/' + TRIM('/' FROM et.location),
-			delta_folder = et.location,
-			data_source_location = eds.location,
-			data_source_name = eds.name
-	from sys.external_tables et 
-    join sys.external_data_sources eds on et.data_source_id = eds.data_source_id
-    join sys.external_file_formats ff on et.file_format_id = ff.file_format_id and LOWER(format_type) = 'delta'
-    where et.name = @table
+union all
+
+select	name = 'REMOVE DUPLICATE REFERENCES',
+        score = 0.9,
+		schema_name = NULL,
+		object = NULL,
+		column_name = NULL,
+		reason = CONCAT('Views ', string_agg(concat(schema_name,'.',name), ','), ' are referencing the same path: ', path)
+from view_path
+group by path
+having count(*) > 1
 )
+SELECT * FROM recommendations
+WHERE schema_name <> 'qpi'
 GO
-/*
-EXEC delta.describe_history 'https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel'
-EXEC delta.describe_history 'timetravel'
-*/
-CREATE OR ALTER PROCEDURE delta.describe_history @name varchar(1024)
+
+CREATE OR ALTER PROCEDURE qpi.generate_cosmosdb_with_schema ( @connection nvarchar(max), @container nvarchar(1000))
 AS BEGIN
-	DECLARE @location VARCHAR(1000);
-	DECLARE @msg VARCHAR(8000);
-	IF (SUBSTRING(@name, 1, 5) NOT IN ('https', 'abfss'))
-	BEGIN
-		SET @msg = CONCAT('Retrieving history for the table ', @name)
-		PRINT (@msg)
-		SELECT @location = delta_uri 
-		FROM delta.get_table_location(@name)
+DECLARE @tsql NVARCHAR(MAX) 
+SET @tsql = "SELECT TOP 10 *
+FROM OPENROWSET( 
+         'CosmosDB',
+        '"+@connection+"',
+        "+@container + ") as data"
 
-		IF (@location IS NULL)
-			RAISERROR('Cannot find an ADLS location for the table ''%s''', 16, 1, @name)
-		ELSE
-			EXEC delta.describe_history @location 
-	END
-	ELSE
-	BEGIN
-		SET @msg = CONCAT('Retrieving history for the Delta Lake location ', @name)
-		PRINT (@msg)
-		SET @location =TRIM('/' FROM @name)
-		DECLARE @tsql VARCHAR(MAX);
+create table #frs (
+    is_hidden bit not null,
+    column_ordinal int not null,
+    name sysname null,
+    is_nullable bit not null,
+    system_type_id int not null,
+    system_type_name nvarchar(256) null,
+    max_length smallint not null,
+    precision tinyint not null,
+    scale tinyint not null,
+    collation_name sysname null,
+    user_type_id int null,
+    user_type_database sysname null,
+    user_type_schema sysname null,
+    user_type_name sysname null,
+    assembly_qualified_type_name nvarchar(4000),
+    xml_collection_id int null,
+    xml_collection_database sysname null,
+    xml_collection_schema sysname null,
+    xml_collection_name sysname null,
+    is_xml_document bit not null,
+    is_case_sensitive bit not null,
+    is_fixed_length_clr_type bit not null,
+    source_server sysname null,
+    source_database sysname null,
+    source_schema sysname null,
+    source_table sysname null,
+    source_column sysname null,
+    is_identity_column bit null,
+    is_part_of_unique_key bit null,
+    is_updateable bit null,
+    is_computed_column bit null,
+    is_sparse_column_set bit null,
+    ordinal_in_order_by_list smallint null,
+    order_by_list_length smallint null,
+    order_by_is_descending smallint null,
+    tds_type_id int not null,
+    tds_length int not null,
+    tds_collation_id int null,
+    tds_collation_sort_id tinyint null
+);
 
-		SET @tsql = CONCAT("
-		SELECT version = CAST(result.filepath(1) AS BIGINT),
-			timestamp = dateadd(s, CAST(JSON_VALUE (jsonContent, '$.commitInfo.timestamp') AS BIGINT)/1000, '19700101'),
-			operation = JSON_VALUE (jsonContent, '$.commitInfo.operation')
-		FROM
-			OPENROWSET(
-				BULK '", @location, "/_delta_log/*.json',
-				FORMAT = 'CSV', FIELDQUOTE = '0x0b', FIELDTERMINATOR ='0x0b', ROWTERMINATOR = '0x0b' )
-			WITH ( jsonContent varchar(MAX) ) AS [result]
-		ORDER BY JSON_VALUE (jsonContent, '$.commitInfo.timestamp') DESC")
-		EXEC(@tsql)
-	END
+insert #frs
+exec sys.sp_describe_first_result_set @tsql;
 
+declare @with_clause nvarchar(max);
+set @with_clause = (select 'WITH (' + string_agg(QUOTENAME(name) + ' ' + system_type_name, ', ') + ')' from #frs);
+
+select
+'Note:', 'This is an autogenerated schema for cosmosDB contianer. Try to optimize it and minimize the types like VARCHAR(8000)!'
+union all
+select 'Query:', "SELECT * FROM OPENROWSET( 'CosmosDB',
+        '"+@connection+"',
+        "+@container + ') ' + @with_clause + ' as data'
+union ALL
+select 'WITH clause:', @with_clause;
 END
 GO
 
-/*
 
-EXEC delta.describe_history 'timetravel';
-
-EXEC delta.snapshot	@name='https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel',
-					@version = 23;
-EXEC delta.snapshot	@name='timetravel',
-					@version = 23;
-EXEC delta.snapshot @name='https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel',
-					@timestamp = '2022-09-19 18:57:00'
-EXEC delta.snapshot @name='timetravel',
-					@timestamp = '2022-09-19 18:57:00'
-EXEC delta.snapshot @name='timetravel',
-					@timestamp = '2022-09-19 18:56:00'
-
-*/
-SET QUOTED_IDENTIFIER OFF
+SET QUOTED_IDENTIFIER OFF; -- Because I use "" as a string literal
 GO
-CREATE OR ALTER PROCEDURE delta.snapshot
-				@name varchar(1024),
-				@version int = null,
-				@timestamp datetime2 = null,
-				@view sysname = null,
-				@schema sysname = 'dbo'
+-- Creates a disgnostic view on a folder where diagnostic settings are created.
+-- Example usage: exec qpi.create_diagnostics 'https://jovanpoptest.dfs.core.windows.net/insights-logs-builtinsqlreqsended/'
+CREATE OR ALTER PROCEDURE qpi.create_diagnostics @path varchar(1024)
 AS BEGIN
-
-	IF(@version IS NULL AND @timestamp IS NULL) BEGIN
-		RAISERROR('You need to specify @version or @timestamp parameters', 16, 1);			
-		RETURN
-	END
-
-	IF(@version IS NOT NULL AND @timestamp IS NOT NULL) BEGIN
-		RAISERROR('You cannot specify both @version and @timestamp parameters', 16, 1);			
-		RETURN
-	END
-	SET QUOTED_IDENTIFIER OFF
-
-	DECLARE @msg VARCHAR(1024);
-
-	IF(@timestamp IS NOT NULL)
-	BEGIN
-		SET @msg = CONCAT('Searching for a version for the timestamp ', @timestamp)
-		PRINT (@msg)
-
-		DROP TABLE IF EXISTS #delta_history
-		CREATE TABLE #delta_history([version] bigint, [timestamp] datetime2, operation varchar(max))
-
-		INSERT INTO #delta_history
-		EXEC delta.describe_history @name
-
-		SELECT @version = cur.version
-		FROM #delta_history cur JOIN #delta_history nex ON cur.version = nex.version - 1
-		WHERE cur.timestamp <= @timestamp AND @timestamp < nex.timestamp
-
-		SET @msg = CONCAT('Version for the timestamp ', @timestamp, ' is "', @version, '"')
-		PRINT (@msg)
-		SET @timestamp = NULL
-		
-	END
-	
-	DECLARE @location VARCHAR(1024);
-	DECLARE @data_source SYSNAME = NULL;
-	DECLARE @delta_folder SYSNAME = NULL;
-	
-	IF (SUBSTRING(@name, 1, 5) NOT IN ('https', 'abfss'))
-	BEGIN
-		SET @view = @name;
-		SET @msg = CONCAT('Retrieving location for the table ', @name)
-		PRINT (@msg)
-		
-		SELECT @location = delta_uri, @data_source = [data_source_name], @delta_folder = delta_folder
-		FROM delta.get_table_location(@name)
-
-		IF (@location IS NULL) BEGIN
-			RAISERROR('Cannot find an ADLS location for the table ''%s''', 10, 1, @name);	
-			RETURN
-		END
-		ELSE
-		BEGIN
-			SET @msg = CONCAT('Location for the table is "', @location, '"')
-			PRINT (@msg)
-		END
-	END ELSE
-	BEGIN
-		DECLARE @invLocation VARCHAR(1024) = REVERSE(TRIM(@name));
-		SET @view = SUBSTRING(@name, LEN(@name) - CHARINDEX('/', @invLocation) + 2, 128)
-		SET @location = @name;
-	END
-
-	CREATE TABLE #log_files([version] BIGINT, [added_file] varchar(4000), [removed_file] varchar(4000), isCheckpoint BIT)
-	INSERT INTO #log_files
-	EXEC delta._get_latest_checkpoint_files @location, @version
-
-	IF(0 = (SELECT COUNT(*) FROM #log_files)) BEGIN
-		RAISERROR('Version "%i" is not available for time travel. Cannot find checkpoint before this version.', 19, 1, @version) WITH LOG;
-		RETURN
-	END
-	ELSE
-	BEGIN
-		DECLARE @latest_checkpoint_version BIGINT
-		select @latest_checkpoint_version = MAX(version) from #log_files
-
-		INSERT INTO #log_files
-		EXEC delta._get_latest_json_logs
-			@location, @latest_checkpoint_version, @version;
-			
-		DECLARE @tsql VARCHAR(MAX);
-		SELECT @tsql = CONCAT(
-	"CREATE OR ALTER VIEW "+ @schema +".[", @view, "@v", @version,"] 
-	  AS SELECT * FROM OPENROWSET ( BULK ", 
-						IIF(COUNT(*)>1, "[",""),
-							STRING_AGG(CAST(("'"+ISNULL(@delta_folder, @location)+'/'+added_file+"'") AS VARCHAR(MAX)),','),
-						IIF(COUNT(*)>1, "]",""),
-						IIF(@data_source IS NOT NULL, ", DATA_SOURCE = '" + @data_source + "'", ""),
-						", FORMAT='PARQUET' ) as data")
-		from #log_files a
-			where added_file is not null
-			and added_file not in (select removed_file from #log_files where removed_file is not null);
-
-		PRINT(@tsql)
-		EXEC(@tsql)
-	END
-END
-GO
-
-/*
-EXEC delta._get_latest_checkpoint_files 
-		'https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel/',
-		20
-*/
-GO
-CREATE OR ALTER PROCEDURE delta._get_latest_checkpoint_files 
-			(@location varchar(1024), @asOfVersion int = 0)
-AS BEGIN
-
-    SET QUOTED_IDENTIFIER OFF
-
-    DECLARE @tsql NVARCHAR(max) = CONCAT("
-    with
-    all_checkpoint_logs (version, added_file, removed_file) as (
-    select version = CAST(a.filepath(1) AS BIGINT), added_file, removed_file
-    from openrowset(bulk '", @location  ,"/_delta_log/*.checkpoint.parquet',
-                    format='parquet')
-            with ( [added_file] varchar(1024) '$.add.path', [removed_file] varchar(1024) '$.remove.path' ) as a
-    where CAST(a.filepath(1) AS BIGINT) <= ", @asOfVersion, "
-	and NOT ( [added_file] IS NULL AND [removed_file] IS NULL)
-    ),
-	last_checkpoint (version, added_file, removed_file) as (
-		select version, added_file, removed_file from all_checkpoint_logs
-		where version = (select max(version) from all_checkpoint_logs)
-	)
-	select *, isCheckpoint = 1 from last_checkpoint");
-
-	EXEC(@tsql)
-END
-GO
-
-/*
-EXEC delta._get_latest_json_logs
-		'https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel/',
-		20, 22
-*/
-GO
-CREATE OR ALTER PROCEDURE delta._get_latest_json_logs 
-			(@location varchar(1024), @version bigint, @asOfVersion bigint = 0)
-AS BEGIN
-
-    -- Add remaining added/removed files from .json files after the last checkpoint
 
 	DECLARE @tsql VARCHAR(MAX);
-	SET @tsql = CONCAT("select version = CAST(r.filepath(1) AS BIGINT), added_file, removed_file, isCheckpoint = 0
-    FROM 
-        OPENROWSET(
-            BULK '", @location, "/_delta_log/*.json',
-            FORMAT='CSV', 
-            FIELDTERMINATOR = '0x0b',
-            FIELDQUOTE = '0x0b', 
-            ROWTERMINATOR = '0x0A'
-        )
-        WITH (jsonContent NVARCHAR(max)) AS [r]
-        CROSS APPLY OPENJSON(jsonContent)
-            WITH (added_file nvarchar(1000) '$.add.path', removed_file nvarchar(1000) '$.remove.path') AS j
-    WHERE (r.filepath(1) >", @version,") --> Take the changes after checkpoint
-    AND ( r.filepath(1) <=", @asOfVersion," ) --> Take the changes before specified AS-OF version 
-	and NOT ( [added_file] IS NULL AND [removed_file] IS NULL)
-    ");
+
+	SET @tsql = CONCAT("DROP EXTERNAL DATA SOURCE [Diagnostics];
+CREATE EXTERNAL DATA SOURCE [Diagnostics] WITH ( LOCATION = '", @path, "' );");
+
 	EXEC(@tsql);
-END
 
-/*
-EXEC delta.describe_history 'timetravel'
-EXEC delta.snapshot 'timetravel', 22, @schema = 'delta'
-select * FROM delta.[timetravel@v22]
-select * from delta.get_table_location ('timetravel')
-EXEC delta.snapshot
-				@name='https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel',
-				@version = 23, 
-				@schema = 'delta';
-SELECT * FROM delta.[time-travel@v23]
-*/
+	SET @tsql = "CREATE OR ALTER VIEW qpi.diagnostics
+AS SELECT
+    subscriptionId = r.filepath(1),
+    resourceGroup = r.filepath(2),
+    workspace = r.filepath(3),
+    year = CAST(r.filepath(4) AS SMALLINT),
+    month = CAST(r.filepath(5) AS TINYINT),
+    day = CAST(r.filepath(6) AS TINYINT),
+    hour = CAST(r.filepath(7) AS TINYINT),
+    minute = CAST(r.filepath(8) AS TINYINT),
+    details.queryType,
+    durationS = CAST(details.durationMs / 1000. AS NUMERIC(8,1)),
+    dataProcessedMB = CAST(details.dataProcessedBytes /1024./1024 AS NUMERIC(16,1)),
+    details.distributedStatementId,
+    details.queryText,
+	details.startTime,
+    details.endTime,
+    details.resultType,
+	details.queryHash,
+    details.operationName,
+    details.endpoint,
+    details.resourceId,
+    details.error
+FROM
+    OPENROWSET(
+        BULK 'resourceId=/SUBSCRIPTIONS/*/RESOURCEGROUPS/*/PROVIDERS/MICROSOFT.SYNAPSE/WORKSPACES/*/y=*/m=*/d=*/h=*/m=*/*.json',
+        DATA_SOURCE = 'Diagnostics',
+        FORMAT = 'CSV',
+        FIELDQUOTE = '0x0b',
+        FIELDTERMINATOR ='0x0b'
+    )
+    WITH (
+        jsonContent varchar(MAX)
+    ) AS r CROSS APPLY OPENJSON(jsonContent)
+                        WITH (  endpoint varchar(128) '$.LogicalServerName',
+                                resourceGroup varchar(128) '$.ResourceGroup',
+                                startTime datetime2 '$.properties.startTime',
+                                endTime datetime2 '$.properties.endTime',
+                                dataProcessedBytes bigint '$.properties.dataProcessedBytes',
+                                durationMs bigint,
+                                loginName varchar(128) '$.identity.loginName',
+                                distributedStatementId varchar(128) '$.properties.distributedStatementId',
+                                resultType varchar(128) ,
+                                queryText varchar(max) '$.properties.queryText',
+                                queryHash varchar(128) '$.properties.queryHash',
+                                operationName varchar(128),
+								error varchar(128) '$.properties.error',
+                                queryType varchar(128) '$.properties.command',
+								resourceId varchar(1024) '$.resourceId'
+                             ) as details";
 
-GO
-/*
-EXEC delta.create_table	'TestTimeTravel', 
-						'https://jovanpoptest.dfs.core.windows.net/my-delta-lake/time-travel'
-*/
-CREATE OR ALTER PROCEDURE delta.create_table @table_name sysname, @path varchar(1024),
-						@data_source sysname = null, 
-						@schema_name sysname = '', @database_name sysname = null
-AS BEGIN
-	EXEC util.create_table @table_name, @path, 'DELTA', @data_source, @schema_name, @database_name; 
-END
-GO
-
-CREATE OR ALTER PROCEDURE delta.create_or_alter_table @table_name sysname, @path varchar(1024),
-						@data_source sysname = null, 
-						@schema_name sysname = '', @database_name sysname = null
-AS BEGIN
-	EXEC util.create_or_alter_table @table_name, @path, 'DELTA', @data_source, @schema_name, @database_name; 
-END
-GO
-
-
-CREATE OR ALTER PROCEDURE delta._get_tables @path varchar(1024), @folder varchar(256) = '/*/*'
-AS BEGIN
-
-	DECLARE @tsql varchar(max);
-	SET @tsql = CONCAT("
-	SELECT	database_name = result.filepath(1),
-			table_name = result.filepath(2),
-			path = REPLACE(result.filepath(), '/_delta_log/_last_checkpoint', ''),
-			version = CAST(JSON_VALUE(jsonContent, '$.version') AS BIGINT)
-	FROM
-		OPENROWSET(
-			BULK '", TRIM('/' FROM @path), '/', TRIM('/' FROM @folder), "/_delta_log/_last_checkpoint',
-			FORMAT = 'CSV',
-			FIELDQUOTE = '0x0b',
-			FIELDTERMINATOR ='0x0b',
-			ROWTERMINATOR = '0x0b'
-		)
-		WITH ( jsonContent varchar(MAX) ) AS [result]");
-	PRINT @tsql
-	EXEC(@tsql);
+		EXEC(@tsql);
 END
 GO
-
-CREATE OR ALTER PROCEDURE delta.discover_tables @path varchar(1024)
-AS BEGIN
-	DROP TABLE IF EXISTS #delta_tables;
-	CREATE TABLE #delta_tables (database_name sysname, table_name sysname, path varchar(1024), version bigint);
-	INSERT INTO #delta_tables
-	EXEC delta._get_tables @path;
-
-	WITH a AS (
-	SELECT *, sql = CONCAT("DROP TABLE IF EXISTS ", database_name, "..", table_name, ";") FROM #delta_tables
-	union all
-	SELECT *, sql = CONCAT("EXEC delta.create_table '",table_name, "' ,'", path, "', @database_name = '", database_name, "' ") FROM #delta_tables
-	)
-	SELECT sql FROM a
-	ORDER BY database_name, table_name, sql
-
-END
-GO
-
-CREATE OR ALTER FUNCTION util.get_data_source_location(@name varchar(128))
-RETURNS TABLE
-AS RETURN (
-    select	eds.location
-    from sys.external_data_sources eds
-    where eds.name = @name
-)
-GO
-
-/*
-util.create_cosmosdb_view 
-			'Account=synapselink-cosmosdb-sqlsample;Database=covid;Key=s5zarR2pT0JWH9k8roipnWxUYBegOuFGjJpSjGlR36y86cW0GQ6RaaG8kGjsRAQoWMw1QKTkkX8HQtFpJjC8Hg==',
-			'Ecdc';
-
-util.create_cosmosdb_view 
-			'Account=synapselink-cosmosdb-sqlsample;Database=covid',
-			'Ecdc',
-			@key = 's5zarR2pT0JWH9k8roipnWxUYBegOuFGjJpSjGlR36y86cW0GQ6RaaG8kGjsRAQoWMw1QKTkkX8HQtFpJjC8Hg==';
-*/
-CREATE OR ALTER PROCEDURE util.create_cosmosdb_view (	@connection nvarchar(max),
-														@container nvarchar(1000),
-														@schema_name sysname = 'dbo',
-														@key varchar(1024) = NULL,
-														@credential sysname = NULL)
-AS BEGIN
-
-	DECLARE @tsql NVARCHAR(MAX) 
-
-	IF(@key IS NOT NULL AND @credential IS NOT NULL)
-	BEGIN
-		PRINT 'Creating CosmosDB credential...'
-		SET @tsql =
-"DROP DATABASE SCOPED CREDENTIAL " + @credential + ";
-CREATE DATABASE SCOPED CREDENTIAL " + @credential + "
-		WITH	IDENTITY = 'SHARED ACCESS SIGNATURE', " + "
-				SECRET = '" + @key + "';"
-		PRINT (@tsql)
-		EXEC (@tsql)
-	END
-
-	IF (@credential IS NULL) 
-		SET @tsql = 
-		"SELECT TOP 0 *
-			FROM OPENROWSET( 
-				'CosmosDB',
-				'"+IIF(CHARINDEX('Key=',@connection)> 0, @connection, @connection+';Key='+@key)+"',
-				"+QUOTENAME(@container) + " ) as data;"
-	ELSE
-		SET @tsql =
-		"SELECT TOP 0 *
-			FROM OPENROWSET( 
-				PROVIDER = 'CosmosDB',
-				CONNECTION = '"+@connection+"',
-				OBJECT = '"+@container + "',
-				CREDENTIAL = '"+@credential + "') as data;"
-
-	create table #frs (
-		is_hidden bit not null,
-		column_ordinal int not null,
-		name sysname null,
-		is_nullable bit not null,
-		system_type_id int not null,
-		system_type_name nvarchar(256) null,
-		max_length smallint not null,
-		precision tinyint not null,
-		scale tinyint not null,
-		collation_name sysname null,
-		user_type_id int null,
-		user_type_database sysname null,
-		user_type_schema sysname null,
-		user_type_name sysname null,
-		assembly_qualified_type_name nvarchar(4000),
-		xml_collection_id int null,
-		xml_collection_database sysname null,
-		xml_collection_schema sysname null,
-		xml_collection_name sysname null,
-		is_xml_document bit not null,
-		is_case_sensitive bit not null,
-		is_fixed_length_clr_type bit not null,
-		source_server sysname null,
-		source_database sysname null,
-		source_schema sysname null,
-		source_table sysname null,
-		source_column sysname null,
-		is_identity_column bit null,
-		is_part_of_unique_key bit null,
-		is_updateable bit null,
-		is_computed_column bit null,
-		is_sparse_column_set bit null,
-		ordinal_in_order_by_list smallint null,
-		order_by_list_length smallint null,
-		order_by_is_descending smallint null,
-		tds_type_id int not null,
-		tds_length int not null,
-		tds_collation_id int null,
-		tds_collation_sort_id tinyint null
-	);
-
-	insert #frs
-	exec sys.sp_describe_first_result_set @tsql;
-
-	declare @with_clause nvarchar(max);
-	set @with_clause = (select ' WITH (' + string_agg(
-												QUOTENAME(name) + ' ' +
-												IIF( CHARINDEX("VARCHAR", system_type_name) = 0, system_type_name, system_type_name + ' COLLATE Latin1_General_100_BIN2_UTF8'),
-											', ') + ')'
-						from #frs);
-
-	set @tsql = "CREATE OR ALTER VIEW " + QUOTENAME(@schema_name) + "." + QUOTENAME(@container) + " AS " + REPLACE(
-					REPLACE(@tsql, "TOP 0", ""),
-					") as data", ") " + @with_clause + ' as data');
-
-	PRINT 'Creating CosmosDB view...'
-	PRINT @tsql
-	EXEC(@tsql)
-END
