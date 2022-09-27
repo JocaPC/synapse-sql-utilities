@@ -437,12 +437,12 @@ AS BEGIN
     DECLARE @tsql NVARCHAR(max) = CONCAT("
     with
     all_checkpoint_logs (version, added_file, removed_file) as (
-    select version = CAST(a.filepath(1) AS BIGINT), added_file = json_value([add], '$.path'), removed_file = json_value([remove], '$.path')
+    select version = CAST(a.filepath(1) AS BIGINT), added_file, removed_file
     from openrowset(bulk '", @location  ,"/_delta_log/*.checkpoint.parquet',
                     format='parquet')
-            with ( [add] varchar(8000), [remove] varchar(8000) ) as a
+            with ( [added_file] varchar(1024) '$.add.path', [removed_file] varchar(1024) '$.remove.path' ) as a
     where CAST(a.filepath(1) AS BIGINT) <= ", @asOfVersion, "
-	and NOT ( [add] IS NULL AND [remove] IS NULL)
+	and NOT ( [added_file] IS NULL AND [removed_file] IS NULL)
     ),
 	last_checkpoint (version, added_file, removed_file) as (
 		select version, added_file, removed_file from all_checkpoint_logs
