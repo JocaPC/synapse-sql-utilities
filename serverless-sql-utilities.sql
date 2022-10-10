@@ -570,6 +570,34 @@ AS RETURN (
 )
 GO
 
+CREATE OR ALTER PROCEDURE util.cetas
+        @table_name sysname, 
+        @location nvarchar(1024),
+        @select nvarchar(max),
+        @data_source sysname,
+        @file_format sysname = 'PARQUET'
+AS
+BEGIN
+    DECLARE @tsql NVARCHAR(max);
+
+    SET QUOTED_IDENTIFIER OFF; -- Because I use "" as a string literal
+
+    SET @tsql = CONCAT(
+"CREATE EXTERNAL TABLE ", QUOTENAME(@table_name), "
+ WITH ( 
+     LOCATION = '", @location, "',
+     DATA_SOURCE = ", @data_source, "
+     FILE_FORMAT = ", @file_format, "
+)
+AS", @select);
+
+    PRINT (@tsql)
+    EXEC (@tsql)
+END
+GO
+
+
+
 /*
 util.create_cosmosdb_view 
 			'Account=synapselink-cosmosdb-sqlsample;Database=covid;Key=s5zarR2pT0JWH9k8roipnWxUYBegOuFGjJpSjGlR36y86cW0GQ6RaaG8kGjsRAQoWMw1QKTkkX8HQtFpJjC8Hg==',
