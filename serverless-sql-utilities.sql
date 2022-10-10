@@ -583,21 +583,21 @@ CREATE OR ALTER PROCEDURE util.cetas
         @file_format sysname = 'PARQUET'
 AS
 BEGIN
-    DECLARE @tsql NVARCHAR(max);
+    DECLARE @tsql NVARCHAR(max);
 
     SET QUOTED_IDENTIFIER OFF; -- Because I use "" as a string literal
 
-    SET @tsql = CONCAT(
+    SET @tsql = CONCAT(
 "CREATE EXTERNAL TABLE ", QUOTENAME(@table_name), "
  WITH ( 
-     LOCATION = '", @location, "',
+     LOCATION = '", @location,"/", @table_name, "',
      DATA_SOURCE = ", @data_source, ",
      FILE_FORMAT = ", @file_format, "
 )
 AS", @select);
 
     PRINT (@tsql)
-    EXEC (@tsql)
+    EXEC (@tsql)
 END
 GO
 
@@ -780,5 +780,4 @@ FROM
 		EXEC(@tsql);
 END
 GO
-
 
