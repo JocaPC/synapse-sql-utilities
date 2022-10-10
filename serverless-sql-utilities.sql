@@ -96,6 +96,27 @@ AS BEGIN
 END
 GO
 
+CREATE OR ALTER PROCEDURE util.create_file_format @file_format varchar(20)
+AS BEGIN
+	declare @tsql varchar(max) = null;
+	if(@file_format IN ('DELTA', 'PARQUET'))
+	begin
+		SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "] WITH ( FORMAT_TYPE = ",@file_format,")");
+		EXEC(@tsql);	
+	end else if (@file_format = 'CSV')
+	begin
+		SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "]
+									WITH ( FORMAT_TYPE = DELIMITEDTEXT, FORMAT_OPTIONS ( STRING_TERMINATOR = ',' ) )");
+		EXEC(@tsql);
+	end else if (@file_format = 'TSV')
+	begin
+		SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "]
+									WITH ( FORMAT_TYPE = DELIMITEDTEXT, FORMAT_OPTIONS ( STRING_TERMINATOR = '\t' ) )");
+		EXEC(@tsql);
+	end
+END
+GO
+
 /*
 EXEC util.create_table 'Test', 'https://<storage account>.dfs.core.windows.net/my-delta-lake/time-travel'
 */
@@ -143,24 +164,8 @@ AS BEGIN
 
 	if(@file_format_name IS NULL)
 	begin
-		if(@file_format IN ('DELTA', 'PARQUET'))
-		begin
-			SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "] WITH ( FORMAT_TYPE = ",@file_format,")");
-			EXEC(@tsql);
-			SET @file_format_name = @file_format;
-		end else if (@file_format = 'CSV')
-		begin
-			SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "]
-										WITH ( FORMAT_TYPE = DELIMITEDTEXT, FORMAT_OPTIONS ( STRING_TERMINATOR = ',' ) )");
-			EXEC(@tsql);
-			SET @file_format_name = @file_format;
-		end else if (@file_format = 'TSV')
-		begin
-			SET @tsql = CONCAT("CREATE EXTERNAL FILE FORMAT [", @file_format, "]
-										WITH ( FORMAT_TYPE = DELIMITEDTEXT, FORMAT_OPTIONS ( STRING_TERMINATOR = '\t' ) )");
-			EXEC(@tsql);
-			SET @file_format_name = @file_format;
-		end
+		exec util.create_file_format @file_format;
+		SET @file_format_name = @file_format;
 	end
 	IF @file_format_name IS NULL BEGIN
 		RAISERROR ( 'Cannot find external format type', 16, 1 );
@@ -586,7 +591,7 @@ BEGIN
 "CREATE EXTERNAL TABLE ", QUOTENAME(@table_name), "
  WITH ( 
      LOCATION = '", @location, "',
-     DATA_SOURCE = ", @data_source, "
+     DATA_SOURCE = ", @data_source, ",
      FILE_FORMAT = ", @file_format, "
 )
 AS", @select);
@@ -775,3 +780,5 @@ FROM
 		EXEC(@tsql);
 END
 GO
+
+
