@@ -677,3 +677,73 @@ CREATE DATABASE SCOPED CREDENTIAL " + @credential + "
 	PRINT @tsql
 	EXEC(@tsql)
 END
+GO
+
+SET QUOTED_IDENTIFIER OFF; -- Because I use "" as a string literal
+GO
+-- Creates a disgnostic view on a folder where diagnostic settings are created.
+-- Example usage: exec qpi.create_diagnostics 'https://jovanpoptest.dfs.core.windows.net/insights-logs-builtinsqlreqsended/'
+CREATE OR ALTER PROCEDURE qpi.create_diagnostics @path varchar(1024)
+AS BEGIN
+
+	DECLARE @tsql VARCHAR(MAX);
+
+	SET @tsql = CONCAT("DROP EXTERNAL DATA SOURCE [Diagnostics];
+CREATE EXTERNAL DATA SOURCE [Diagnostics] WITH ( LOCATION = '", @path, "' );");
+
+	EXEC(@tsql);
+
+	SET @tsql = "CREATE OR ALTER VIEW qpi.diagnostics
+AS SELECT
+    subscriptionId = r.filepath(1),
+    resourceGroup = r.filepath(2),
+    workspace = r.filepath(3),
+    year = CAST(r.filepath(4) AS SMALLINT),
+    month = CAST(r.filepath(5) AS TINYINT),
+    day = CAST(r.filepath(6) AS TINYINT),
+    hour = CAST(r.filepath(7) AS TINYINT),
+    minute = CAST(r.filepath(8) AS TINYINT),
+    details.queryType,
+    durationS = CAST(details.durationMs / 1000. AS NUMERIC(8,1)),
+    dataProcessedMB = CAST(details.dataProcessedBytes /1024./1024 AS NUMERIC(16,1)),
+    details.distributedStatementId,
+    details.queryText,
+    details.startTime,
+    details.endTime,
+    details.resultType,
+    --details.queryHash,
+    details.operationName,
+    details.endpoint,
+    details.resourceId,
+    details.error
+FROM
+    OPENROWSET(
+        BULK 'resourceId=/SUBSCRIPTIONS/*/RESOURCEGROUPS/*/PROVIDERS/MICROSOFT.SYNAPSE/WORKSPACES/*/y=*/m=*/d=*/h=*/m=*/*.json',
+        DATA_SOURCE = 'Diagnostics',
+        FORMAT = 'CSV',
+        FIELDQUOTE = '0x0b',
+        FIELDTERMINATOR ='0x0b'
+    )
+    WITH (
+        jsonContent varchar(MAX)
+    ) AS r CROSS APPLY OPENJSON(jsonContent)
+                        WITH (  endpoint varchar(128) '$.LogicalServerName',
+                                resourceGroup varchar(128) '$.ResourceGroup',
+                                startTime datetime2 '$.properties.startTime',
+                                endTime datetime2 '$.properties.endTime',
+                                dataProcessedBytes bigint '$.properties.dataProcessedBytes',
+                                durationMs bigint,
+                                loginName varchar(128) '$.identity.loginName',
+                                distributedStatementId varchar(128) '$.properties.distributedStatementId',
+                                resultType varchar(128) ,
+                                queryText varchar(max) '$.properties.queryText',
+                                queryHash varchar(128) '$.properties.queryHash',
+                                operationName varchar(128),
+								error varchar(128) '$.properties.error',
+                                queryType varchar(128) '$.properties.command',
+								resourceId varchar(1024) '$.resourceId'
+                             ) as details";
+
+		EXEC(@tsql);
+END
+GO
