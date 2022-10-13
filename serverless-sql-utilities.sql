@@ -715,8 +715,8 @@ GO
 SET QUOTED_IDENTIFIER OFF; -- Because I use "" as a string literal
 GO
 -- Creates a disgnostic view on a folder where diagnostic settings are created.
--- Example usage: exec qpi.create_diagnostics 'https://jovanpoptest.dfs.core.windows.net/insights-logs-builtinsqlreqsended/'
-CREATE OR ALTER PROCEDURE qpi.create_diagnostics @path varchar(1024)
+-- Example usage: exec util.create_diagnostics 'https://jovanpoptest.dfs.core.windows.net/insights-logs-builtinsqlreqsended/'
+CREATE OR ALTER PROCEDURE util.create_diagnostics @path varchar(1024)
 AS BEGIN
 
 	DECLARE @tsql VARCHAR(MAX);
@@ -726,7 +726,7 @@ CREATE EXTERNAL DATA SOURCE [Diagnostics] WITH ( LOCATION = '", @path, "' );");
 
 	EXEC(@tsql);
 
-	SET @tsql = "CREATE OR ALTER VIEW qpi.diagnostics
+	SET @tsql = "CREATE OR ALTER VIEW util.diagnostics
 AS SELECT
     subscriptionId = r.filepath(1),
     resourceGroup = r.filepath(2),
@@ -772,9 +772,9 @@ FROM
                                 queryText varchar(max) '$.properties.queryText',
                                 queryHash varchar(128) '$.properties.queryHash',
                                 operationName varchar(128),
-								error varchar(128) '$.properties.error',
+				error varchar(128) '$.properties.error',
                                 queryType varchar(128) '$.properties.command',
-								resourceId varchar(1024) '$.resourceId'
+				resourceId varchar(1024) '$.resourceId'
                              ) as details";
 
 		EXEC(@tsql);
