@@ -411,9 +411,9 @@ AS BEGIN
 		SELECT @tsql = CONCAT(
 	"CREATE OR ALTER VIEW "+ @schema +".[", @view, "@v", @version,"] 
 	  AS SELECT * FROM OPENROWSET ( BULK ", 
-						IIF(COUNT(*)>1, "[",""),
+						IIF(COUNT(*)>1, "(",""),
 							STRING_AGG(CAST(("'"+ISNULL(@delta_folder, @location)+'/'+added_file+"'") AS VARCHAR(MAX)),','),
-						IIF(COUNT(*)>1, "]",""),
+						IIF(COUNT(*)>1, ")",""),
 						IIF(@data_source IS NOT NULL, ", DATA_SOURCE = '" + @data_source + "'", ""),
 						", FORMAT='PARQUET' ) as data")
 		from #log_files a
