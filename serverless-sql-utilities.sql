@@ -407,21 +407,40 @@ AS BEGIN
 		EXEC delta._get_latest_json_logs
 			@location, @latest_checkpoint_version, @version;
 			
+		DECLARE @path_list VARCHAR(MAX) = '';
+		DECLARE @path_count VARCHAR(MAX) = '';
+
+		SELECT
+			@path_count = COUNT(*), 
+			@path_list = STRING_AGG(CAST(("'"+ISNULL(@delta_folder, @location)+'/'+added_file+"'") AS VARCHAR(MAX)),',')
+		from #log_files a
+			where added_file is not null
+			and added_file not in (select removed_file from #log_files where removed_file is not null);
+
+		--SELECT @path_count, @path_list
+
 		DECLARE @tsql VARCHAR(MAX);
 		SELECT @tsql = CONCAT(
 	"CREATE OR ALTER VIEW "+ @schema +".[", @view, "@v", @version,"] 
 	  AS SELECT * FROM OPENROWSET ( BULK ", 
-						IIF(COUNT(*)>1, "(",""),
-							STRING_AGG(CAST(("'"+ISNULL(@delta_folder, @location)+'/'+added_file+"'") AS VARCHAR(MAX)),','),
-						IIF(COUNT(*)>1, ")",""),
+
+					CASE
+						WHEN @path_count = 1 THEN @path_list
+						WHEN 1 < @path_count AND @path_count < 1024 THEN '('+@path_list+')'
+						ELSE CONCAT('''', ISNULL(@delta_folder, @location) + '/**''')
+					END
+						, 
 						IIF(@data_source IS NOT NULL, ", DATA_SOURCE = '" + @data_source + "'", ""),
-						", FORMAT='PARQUET' ) as data")
+						", FORMAT='PARQUET' ) as data"
+						+ IIF (@path_count < 1024, "", 
+								" WHERE data.filepath() IN " + '('+@path_list+')'))
 		from #log_files a
 			where added_file is not null
 			and added_file not in (select removed_file from #log_files where removed_file is not null);
 
 		PRINT(@tsql)
 		EXEC(@tsql)
+	
 	END
 END
 GO
