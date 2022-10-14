@@ -71,31 +71,6 @@ AS BEGIN
 END
 GO
 
-
-CREATE OR ALTER PROCEDURE util.die_table @table_name sysname, @schema_name sysname = ''
-AS BEGIN
-	IF(0<(SELECT count(*) FROM sys.external_tables 
-							WHERE name = @table_name 
-							AND SCHEMA_NAME(schema_id) = IIF(@schema_name = '', SCHEMA_NAME(), @schema_name)))
-	BEGIN
-		DECLARE @tsql NVARCHAR(4000) = 'DROP EXTERNAL TABLE ' + IIF(@schema_name = '', SCHEMA_NAME(), QUOTENAME(@schema_name)) + '.' + QUOTENAME(@table_name);
-		PRINT(@tsql)
-		EXEC(@tsql)
-	END
-END
-GO
-
-CREATE OR ALTER PROCEDURE util.create_or_alter_table @table_name sysname, @path varchar(1024),
-						@file_format sysname, @data_source sysname = null, 
-						@schema_name sysname = '', @database_name sysname = null
-AS BEGIN
-	EXEC util.die_table @table_name, @schema_name
-	EXEC util.create_table @table_name, @path,
-						@file_format, @data_source, 
-						@schema_name, @database_name
-END
-GO
-
 CREATE OR ALTER PROCEDURE util.create_file_format @file_format varchar(20)
 AS BEGIN
 	declare @tsql varchar(max) = null;
@@ -234,6 +209,30 @@ AS BEGIN
 	PRINT 'Creating external table...'
 	PRINT(@tsql)
 	EXEC(@tsql)
+END
+GO
+
+CREATE OR ALTER PROCEDURE util.die_table @table_name sysname, @schema_name sysname = ''
+AS BEGIN
+	IF(0<(SELECT count(*) FROM sys.external_tables 
+							WHERE name = @table_name 
+							AND SCHEMA_NAME(schema_id) = IIF(@schema_name = '', SCHEMA_NAME(), @schema_name)))
+	BEGIN
+		DECLARE @tsql NVARCHAR(4000) = 'DROP EXTERNAL TABLE ' + IIF(@schema_name = '', SCHEMA_NAME(), QUOTENAME(@schema_name)) + '.' + QUOTENAME(@table_name);
+		PRINT(@tsql)
+		EXEC(@tsql)
+	END
+END
+GO
+
+CREATE OR ALTER PROCEDURE util.create_or_alter_table @table_name sysname, @path varchar(1024),
+						@file_format sysname, @data_source sysname = null, 
+						@schema_name sysname = '', @database_name sysname = null
+AS BEGIN
+	EXEC util.die_table @table_name, @schema_name
+	EXEC util.create_table @table_name, @path,
+						@file_format, @data_source, 
+						@schema_name, @database_name
 END
 GO
 
@@ -780,4 +779,3 @@ FROM
 		EXEC(@tsql);
 END
 GO
-
