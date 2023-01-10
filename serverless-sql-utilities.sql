@@ -798,3 +798,45 @@ FROM
 		EXEC(@tsql);
 END
 GO
+
+SET QUOTED_IDENTIFIER OFF
+GO
+CREATE OR ALTER PROCEDURE util.list_files(@uri_pattern varchar(8000))
+AS BEGIN
+
+	DECLARE @tsql NVARCHAR(MAX);
+	SET @tsql = "
+with parts as (
+select	
+		uri = f.filepath(), --substring(f.filepath(),0, patindex('%'+f.filepath(1)+'%',f.filepath())),
+		domain = substring( f.filepath(),
+							patindex('%://%',f.filepath())+3,
+							charindex(	'/',
+										f.filepath(), 
+										patindex('%://%',f.filepath())+3) - (patindex('%://%',f.filepath())+3)
+							),
+		container = substring(	f.filepath(),
+								charindex('/', f.filepath(),  patindex('%://%',f.filepath())+3)+1,
+				/*cont_end=*/(charindex('/', f.filepath(),  charindex('/', f.filepath(),  patindex('%.net/%',f.filepath())+5))-1)
+								-
+				/*cont_start=*/(charindex('/', f.filepath(),  patindex('%://%',f.filepath())+3))
+							),
+		prefix = substring(	f.filepath(),
+				/*cont_end=*/(charindex('/', f.filepath(),  charindex('/', f.filepath(),  patindex('%.net/%',f.filepath())+5))),
+				patindex('%'+f.filepath(1)+'%',f.filepath())
+				-
+				/*cont_end=*/(charindex('/', f.filepath(),  charindex('/', f.filepath(),  patindex('%.net/%',f.filepath())+5)))
+				),
+		folder = f.filepath(1),
+		suffix = substring(f.filepath(), patindex('%'+f.filepath(1)+'%',f.filepath())+len(f.filepath(1)),8000)
+from openrowset(bulk '"+@uri_pattern+"',
+					format='csv',
+					fieldterminator ='0x0b',
+					fieldquote = '0x0b')
+with(a varchar(max)) as f
+)
+select abfss = concat('abfss://',container,'@',domain,prefix,folder,suffix), parts.*
+from parts";
+	EXEC(@tsql)
+
+END
