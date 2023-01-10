@@ -801,7 +801,7 @@ GO
 
 SET QUOTED_IDENTIFIER OFF
 GO
-CREATE OR ALTER PROCEDURE util.list_files(@uri_pattern varchar(8000))
+CREATE OR ALTER PROCEDURE util.list_files @uri_pattern varchar(8000), @template varchar(max) = ''
 AS BEGIN
 
 	DECLARE @tsql NVARCHAR(MAX);
@@ -834,9 +834,17 @@ from openrowset(bulk '"+@uri_pattern+"',
 					fieldterminator ='0x0b',
 					fieldquote = '0x0b')
 with(a varchar(max)) as f
-)
+),
+abfss_cte as (
 select abfss = concat('abfss://',container,'@',domain,prefix,folder,suffix), parts.*
-from parts";
+from parts
+)
+SELECT *" + 
+	CASE @template WHEN '' THEN ''
+	ELSE ", script = REPLACE('"+@template+"', '{abfss}',abfss)"
+	--ELSE "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE('"+@template+"', '{domain}',domain), '{container}',container), '{prefix}',prefix), '{folder}',folder), '{suffix}',suffix), '{abfss}',abfss)"
+	END +
+" FROM abfss_cte";
 	EXEC(@tsql)
 
 END
