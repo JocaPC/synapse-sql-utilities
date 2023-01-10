@@ -798,17 +798,20 @@ FROM
 		EXEC(@tsql);
 END
 GO
-
 SET QUOTED_IDENTIFIER OFF
 GO
-CREATE OR ALTER PROCEDURE util.list_files @uri_pattern varchar(8000), @template varchar(max) = ''
+CREATE OR ALTER PROCEDURE util.list_files @uri_pattern varchar(8000), @template varchar(max) = '', @_delta_log_last_checkpoint bit = 0
 AS BEGIN
 
 	DECLARE @tsql NVARCHAR(MAX);
 	SET @tsql = "
 with parts as (
 select	
-		uri = f.filepath(), --substring(f.filepath(),0, patindex('%'+f.filepath(1)+'%',f.filepath())),
+		uri = " +
+		CASE @_delta_log_last_checkpoint WHEN 0 THEN " f.filepath() "
+			ELSE " REPLACE(f.filepath(),'/_delta_log/_last_checkpoint', '') "
+		END
+		+",
 		domain = substring( f.filepath(),
 							patindex('%://%',f.filepath())+3,
 							charindex(	'/',
@@ -828,7 +831,11 @@ select
 				/*cont_end=*/(charindex('/', f.filepath(),  charindex('/', f.filepath(),  patindex('%.net/%',f.filepath())+5)))
 				),
 		folder = f.filepath(1),
-		suffix = substring(f.filepath(), patindex('%'+f.filepath(1)+'%',f.filepath())+len(f.filepath(1)),8000)
+		suffix = " +
+		CASE @_delta_log_last_checkpoint WHEN 0 
+				THEN " substring(f.filepath(), patindex('%'+f.filepath(1)+'%',f.filepath())+len(f.filepath(1)),8000) "
+				ELSE " REPLACE(substring(f.filepath(), patindex('%'+f.filepath(1)+'%',f.filepath())+len(f.filepath(1)),8000),'/_delta_log/_last_checkpoint', '') "
+		END + " 
 from openrowset(bulk '"+@uri_pattern+"',
 					format='csv',
 					fieldterminator ='0x0b',
@@ -847,4 +854,10 @@ SELECT *" +
 " FROM abfss_cte";
 	EXEC(@tsql)
 
+END
+GO
+CREATE OR ALTER PROCEDURE delta.list_folders @uri_pattern varchar(8000), @template varchar(max) = '', @_delta_log_last_checkpoint bit = 0
+AS BEGIN
+	SET @uri_pattern = @uri_pattern + '/_delta_log/_last_checkpoint';
+	EXEC util.list_files @uri_pattern, @template, 1
 END
