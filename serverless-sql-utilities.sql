@@ -236,6 +236,213 @@ AS BEGIN
 END
 GO
 
+SET QUOTED_IDENTIFIER OFF
+GO
+/*
+EXEC util.clone_data_source 
+		'SqlOnDemandDemo',
+		'cloned_SqlOnDemandDemo', 
+		'NewDatabase' -- target database
+		, 'CRED1'  --> optionally set the crednetial
+*/
+CREATE OR ALTER PROCEDURE util.clone_data_source
+								@ds_name sysname,
+								@new_ds_name sysname,
+								@target_db_name sysname = NULL,
+								@credential sysname = NULL
+AS
+BEGIN
+	DECLARE @tsql NVARCHAR(MAX)
+	SET @tsql = CONCAT('
+IF ((SELECT count(*) FROM sys.external_data_sources WHERE name = ''',@new_ds_name,''')>0)
+	DROP EXTERNAL DATA SOURCE ',@new_ds_name)
+	
+	SET @tsql = CONCAT('USE ', QUOTENAME(ISNULL(@target_db_name, DB_NAME())), ';', @tsql)
+	EXEC (@tsql)
+
+	SET @tsql = (
+	select 
+		CONCAT('CREATE EXTERNAL DATA SOURCE ',@new_ds_name, '  
+WITH (
+	LOCATION = ''', location,'''',
+	IIF(@credential IS NOT NULL, ', CREDENTIAL = ' + @credential, '')
+	,')') 
+	from sys.external_data_sources eds
+	where name = @ds_name)
+
+	SET @tsql = CONCAT('USE ', QUOTENAME(ISNULL(@target_db_name, DB_NAME())), ';', @tsql)
+	EXEC(@tsql)
+END
+
+
+GO
+/*
+EXEC util.clone_file_format 
+		'QuotedCsvWithHeader',     -- 1.0 csv 
+		'upgraded_csv_2_0_format1', -- name of clone
+		'CopyOfDb' -- target database
+		,@parser_version = '2.0' -- optional change parser version
+*/
+
+CREATE OR ALTER PROCEDURE util.clone_file_format
+								@format_name sysname,
+								@new_format_name sysname,
+								@target_db_name sysname = NULL,
+								@parser_version varchar(20) = NULL
+AS
+BEGIN
+	DECLARE @tsql NVARCHAR(MAX)
+	SET @tsql = CONCAT('
+IF ((SELECT count(*) FROM sys.external_file_formats WHERE name = ''',@new_format_name,''')>0)
+	DROP EXTERNAL FILE FORMAT ',@new_format_name)
+	
+	SET @tsql = CONCAT('USE ', QUOTENAME(ISNULL(@target_db_name, DB_NAME())), ';', @tsql)
+	EXEC (@tsql)
+
+	SET @tsql = (
+	select 
+		CONCAT('CREATE EXTERNAL FILE FORMAT ',@new_format_name, '  
+WITH (
+	FORMAT_TYPE = ',format_type,
+		IIF(format_type<>'DELIMITEDTEXT', '',
+			CONCAT(', FORMAT_OPTIONS (
+				FIELD_TERMINATOR = ''', field_terminator,''',
+				STRING_DELIMITER = ''', string_delimiter,''',
+				FIRST_ROW = ', first_row,', 
+				/*DATE_FORMAT = ''', date_format, ''', */,
+				ENCODING = ''UTF8'',
+				PARSER_VERSION = ''',IIF(@parser_version IS NOT NULL,@parser_version, ISNULL(parser_version,'1.0')),''')
+			)')
+		)) 
+	from sys.external_file_formats
+	where name = @format_name)
+
+	SET @tsql = CONCAT('USE ', QUOTENAME(ISNULL(@target_db_name, DB_NAME())), ';', @tsql)
+	PRINT(@tsql)
+END
+GO
+
+
+/*
+
+EXEC util.clone_table
+			'dbo', 'progress_adddress', -- existing table Lake Database
+			'csv','progress_adddress',  -- new upgraded table in Target Database
+			'QuotedCsvWithHeader_2_0', 
+			'SqlOnDemandDemo',
+			'sampleV3'
+*/
+CREATE OR ALTER PROCEDURE util.clone_table
+                                                  @schema_name sysname,
+                                                  @table_name sysname,
+                                                  @new_schema_name sysname,
+                                                  @new_table_name sysname,
+                                                  @format_name sysname,
+                                                  @data_source_name sysname,
+                                                  @target_db_name sysname = NULL
+AS
+BEGIN
+       SET QUOTED_IDENTIFIER OFF
+       DECLARE @tsql NVARCHAR(MAX)
+       SET @tsql = CONCAT('
+IF ((SELECT count(*)
+              FROM sys.external_tables
+              WHERE name = ''',@new_table_name,'''
+              AND schema_name(schema_id) = ''', @new_schema_name,''')>0)
+       DROP EXTERNAL TABLE ',@new_schema_name,'.',@new_table_name)
+       
+       SET @tsql = CONCAT(N'USE ', QUOTENAME(ISNULL(@target_db_name, DB_NAME())), ';', @tsql)
+       EXEC (@tsql)
+
+
+       SET @tsql = CONCAT(CAST('' AS varchar(max)),";
+with
+csv_tables as (
+select et.object_id, et.schema_id, et.name, et.location, et.table_options, data_source = eds.name
+from sys.external_tables et
+       join sys.external_data_sources eds on et.data_source_id = eds.data_source_id
+       join sys.external_file_formats eff on et.file_format_id = eff.file_format_id
+--where eff.format_type = 'DELIMITEDTEXT'
+),
+table_columns as (
+select  et.object_id,
+              col_schema = string_agg(CAST(CONCAT_WS(' ',	c.name,  
+															case t.name
+																	when 'varchar' then concat('varchar(',  iif(c.max_length=-1,'8000',CAST( c.max_length AS VARCHAR(10))) ,') COLLATE ', c.collation_name)
+																	when 'char' then concat('char(',  iif(c.max_length=-1,'8000',CAST( c.max_length AS VARCHAR(10))) ,') COLLATE ', c.collation_name)
+																	when 'varbinary' then concat('varbinary(', iif(c.max_length=-1,'8000',CAST( c.max_length AS VARCHAR(10))) ,') ')
+																	when 'binary' then concat('binary(', iif(c.max_length=-1,'8000',CAST( c.max_length AS VARCHAR(10))) ,') ')
+																	when 'float' then concat('float(', c.precision,')')
+																	when 'real' then concat('real(', c.precision, ')')
+																	when 'double' then concat('double(', c.precision,',', c.scale, ')')
+																	when 'decimal' then concat('decimal(', c.precision,',', c.scale, ')')
+																	when 'numeric' then concat('numeric(', c.precision,',', c.scale, ')')
+																	when 'datetime2' then 'varchar(64)'
+																	when 'datetime' then 'varchar(64)'
+																	when 'datetimeoffset' then 'varchar(64)'
+																	else t.name
+															end) AS VARCHAR(MAX)), ', ')
+															WITHIN GROUP ( ORDER BY c.column_id ASC )
+from sys.external_tables et
+       join sys.external_data_sources eds on et.data_source_id = eds.data_source_id
+       join sys.external_file_formats eff on et.file_format_id = eff.file_format_id
+       join sys.columns c on et.object_id = c.object_id
+       join sys.types t on c.system_type_id = t.system_type_id
+--where eff.format_type = 'DELIMITEDTEXT'
+group by et.object_id
+)
+select CONCAT('CREATE EXTERNAL TABLE ', '",QUOTENAME(@new_schema_name), '.', QUOTENAME(@new_table_name),"(', c.col_schema, 
+                             ') WITH (
+                                    LOCATION = ''', et.location, ''', 
+                                    DATA_SOURCE = ", QUOTENAME(@data_source_name), ",
+                                    FILE_FORMAT = ", QUOTENAME(@format_name), ",
+                                    TABLE_OPTIONS = ''', ISNULL(et.table_options,'{}'), ''')')
+from csv_tables et
+       join table_columns c on et.object_id = c.object_id
+where et.name = '", @table_name,"' and schema_name(et.schema_id) = '", @schema_name,"'");
+
+       CREATE TABLE #query
+       (
+          sqlText VARCHAR(MAX)
+       )
+       PRINT(@tsql)
+       INSERT INTO #query
+       EXEC(@tsql)
+       
+
+       SELECT @tsql = sqlText FROM #query
+       SET @tsql = CONCAT(CAST('USE ' AS VARCHAR(MAX)), QUOTENAME(ISNULL(@target_db_name, DB_NAME())), ';', @tsql)
+       PRINT '-------------------------------------'
+       PRINT '---		Creating table			---'
+       PRINT '-------------------------------------'
+       PRINT(@tsql)
+       EXEC(@tsql)
+
+END
+GO
+
+CREATE OR ALTER VIEW util.external_tables
+AS
+SELECT et.object_id, schema_name = SCHEMA_NAME(et.schema_id), et.name, 
+		eff.format_type, data_source_location = eds.location, et.location, 
+		format_name = eff.name, data_source_name = eds.name, parser_version
+from sys.external_tables et
+	join sys.external_data_sources eds on et.data_source_id = eds.data_source_id
+	join sys.external_file_formats eff on et.file_format_id = eff.file_format_id
+GO
+/* The query that generates a script that cloes all tables:
+SET QUOTED_IDENTIFIER OFF
+declare @target_database_name sysname = 'TargetDb';
+select CONCAT("EXEC util.clone_table
+			'",schema_name,"', '",name,"',
+			'",schema_name,"', '",name,"',
+			'",format_name,"', 
+			'",data_source_name,"',
+			'",@target_database_name,"'")
+from util.external_tables
+*/
+GO
+
 
 -----------------------------------------------------------------------------------
 --			Delta Lake utilities
